@@ -1,0 +1,120 @@
+name: .NET Tests & Auto-commit
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+  issue_comment:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+
+  check-target:
+    runs-on: ubuntu-latest
+    outputs:
+      pr_valid: ${{ steps.check.outputs.pr_valid }}
+    steps:
+      - name: 🚫 Проверка PR в main
+        id: check
+        shell: bash
+        run: |
+          PR_BASE="${{ github.event.pull_request.base.ref || '' }}"
+          echo "Base branch: $PR_BASE"
+          if [ "$PR_BASE" = "main" ]; then
+            echo "❌ Нельзя отправлять работу в main ветку."
+            echo "pr_valid=false" >> $GITHUB_OUTPUT
+            exit 1
+          else
+            echo "✅ PR направлен в '$PR_BASE', можно запускать тесты."
+            echo "pr_valid=true" >> $GITHUB_OUTPUT
+          fi
+  tests:
+    name: Run test
+    runs-on: windows-latest
+    needs: check-target
+    if: |
+      (github.event_name == 'pull_request_target' && needs.check-target.outputs.pr_valid == 'true') ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'issue_comment'
+    strategy:
+      matrix:
+        configuration: [Debug]
+
+    steps:
+    - name: Checkout code safely
+      uses: actions/checkout@v4
+      with:
+        # Берем код из head PR только если это PR
+        repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        ref: ${{ github.event.pull_request.head.sha || github.ref }}
+        fetch-depth: 0
+
+    - name: Install .NET Core
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Setup MSBuild.exe
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Restore
+      run: dotnet restore Lab4/Lab4.sln
+
+    - name: Build
+      run: dotnet build Lab4/Lab4.sln --configuration ${{ matrix.configuration }} --no-restore
+
+    - name: Run tests (Purple→Blue→Green→White) (vstest)
+      id: cascade
+      shell: pwsh
+      env:
+        CFG: ${{ matrix.configuration }}
+      run: |
+        $proj = "Lab4test/Lab4test.csproj"
+        Write-Host "Building test project..."
+        dotnet build $proj -c $Env:CFG
+
+        # Путь к dll — поправь, если у тебя другой target framework
+        $dll = Join-Path $PWD "Lab4test\bin\$Env:CFG\net8.0\Lab4test.dll"
+        Write-Host "Test DLL: $dll"
+        if (-not (Test-Path $dll)) {
+          Write-Error "DLL не найдена: $dll"
+          exit 1
+        }
+
+        $colors = @('Purple','Blue','Green','White')
+
+        foreach ($c in $colors) {
+          Write-Host "-------------------------------"
+          Write-Host "🔎 Попытка запустить тесты для класса: ${c}Test"
+
+          $filter = "FullyQualifiedName~${c}Test"
+          Write-Host "Используем фильтр: $filter"
+
+          # Опция --TestCaseFilter применяется к vstest. Лог TRX сохраняется.
+          dotnet vstest $dll --TestCaseFilter:"$filter" --Logger:"trx;LogFileName=test-$c.trx"
+
+          $rc = $LASTEXITCODE
+          if ($rc -eq 0) {
+            Write-Host "✅ Класс ${c}Test прошёл (exit $rc). Останавливаем каскад."
+            exit 0
+          } else {
+            Write-Host "❌ Класс ${c}Test не прошёл (exit $rc). Продолжаем к следующему."
+          }
+        }
+
+        Write-Host "❌ НИ ОДИН класс не прошёл."
+        exit 1
+
+    - name: Upload TRX
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: trx-${{ matrix.configuration }}
+        path: '**/test-results.trx'
